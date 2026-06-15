@@ -40,6 +40,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/notify"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -183,6 +184,21 @@ files from the webdav server then you can try this option.
 `,
 				Advanced: true,
 				Default:  false,
+			}, {
+				Name: "desktop_notify",
+				Help: `Send desktop notifications on errors.
+
+When enabled, rclone will send system desktop notifications for
+important WebDAV errors such as permission denied (403), file locked
+(423), or insufficient storage (507). This allows you to see errors
+even when running rclone in the background.
+
+Notifications are sent via the system's native notification mechanism
+(Toast on Windows 10+, balloon tips on Windows 7, D-Bus on Linux,
+Notification Center on macOS).
+`,
+				Advanced: true,
+				Default:  true,
 			}},
 	})
 }
@@ -203,6 +219,7 @@ type Options struct {
 	ExcludeMounts      bool                 `config:"owncloud_exclude_mounts"`
 	UnixSocket         string               `config:"unix_socket"`
 	AuthRedirect       bool                 `config:"auth_redirect"`
+	DesktopNotify      bool                 `config:"desktop_notify"`
 }
 
 // Fs represents a remote webdav
@@ -297,6 +314,54 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
+// handleHTTPError maps HTTP errors from the WebDAV server to sentinel errors
+// and sends user-visible messages and desktop notifications for important errors.
+//
+// It returns the original err if no special handling is needed.
+func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op string) error {
+	apiErr, ok := err.(*api.Error)
+	if !ok {
+		return err
+	}
+	switch apiErr.StatusCode {
+	case http.StatusForbidden:
+		// 403 Forbidden - permission denied
+		fs.Errorf(f, "%s: 权限被拒绝 (403 Forbidden): %v", remote, apiErr)
+		if f.opt.DesktopNotify {
+			notify.SendAlert("rclone - 权限被拒绝",
+				fmt.Sprintf("%s: %s", remote, apiErr.Message))
+		}
+		return fmt.Errorf("%s: %w", op, fs.ErrorPermissionDenied)
+
+	case http.StatusLocked:
+		// 423 Locked - file is locked by another process
+		fs.Logf(f, "%s: 文件被锁定 (423 Locked): %v", remote, apiErr)
+		if f.opt.DesktopNotify {
+			notify.Send("rclone - 文件被锁定",
+				fmt.Sprintf("%s: %s", remote, apiErr.Message))
+		}
+		return fmt.Errorf("%s: %w", op, err)
+
+	case http.StatusInsufficientStorage:
+		// 507 Insufficient Storage - quota exceeded
+		fs.Errorf(f, "%s: 存储空间不足 (507 Insufficient Storage): %v", remote, apiErr)
+		if f.opt.DesktopNotify {
+			notify.SendAlert("rclone - 存储空间不足",
+				fmt.Sprintf("%s: %s", remote, apiErr.Message))
+		}
+		return fmt.Errorf("%s: %w", op, fs.ErrorQuotaExceeded)
+
+	case http.StatusNotFound:
+		// 404 - handled by callers, but ensure consistent messaging
+		fs.Debugf(f, "%s: 未找到 (404 Not Found): %v", remote, apiErr)
+
+	default:
+		// For other errors, log a summary at debug level
+		fs.Debugf(f, "%s: HTTP %d: %v", remote, apiErr.StatusCode, apiErr)
+	}
+	return err
+}
+
 // safeRoundTripper is a wrapper for http.RoundTripper that serializes
 // http roundtrips. NTLM authentication sequence can involve up to four
 // rounds of negotiations and might fail due to concurrency.
@@ -373,6 +438,9 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Pr
 			// the method to GET).  However we can assume that if it was redirected the
 			// object was not found.
 			return nil, fs.ErrorObjectNotFound
+		}
+		if mappedErr := f.handleHTTPError(ctx, apiErr, path, "read metadata"); mappedErr != apiErr {
+			return nil, mappedErr
 		}
 	}
 	if err != nil {
@@ -819,6 +887,9 @@ func (f *Fs) listAll(ctx context.Context, dir string, directoriesOnly bool, file
 				}
 				return found, fs.ErrorDirNotFound
 			}
+			if mappedErr := f.handleHTTPError(ctx, apiErr, dir, "list"); mappedErr != apiErr {
+				return found, mappedErr
+			}
 		}
 		return found, fmt.Errorf("couldn't list files: %w", err)
 	}
@@ -1053,7 +1124,9 @@ func (f *Fs) _mkdir(ctx context.Context, dirPath string) error {
 		if f._dirExists(ctx, dirPath) {
 			return nil
 		}
-
+		if mappedErr := f.handleHTTPError(ctx, apiErr, dirPath, "mkdir"); mappedErr != apiErr {
+			return mappedErr
+		}
 	}
 	return err
 }
@@ -1069,6 +1142,9 @@ func (f *Fs) mkdir(ctx context.Context, dirPath string) (err error) {
 			if err == nil {
 				err = f._mkdir(ctx, dirPath)
 			}
+		}
+		if mappedErr := f.handleHTTPError(ctx, apiErr, dirPath, "mkdir"); mappedErr != apiErr {
+			return mappedErr
 		}
 	}
 	return err
@@ -1124,6 +1200,11 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
+		if apiErr, ok := err.(*api.Error); ok {
+			if mappedErr := f.handleHTTPError(ctx, apiErr, dir, "rmdir"); mappedErr != apiErr {
+				return mappedErr
+			}
+		}
 		return fmt.Errorf("rmdir failed: %w", err)
 	}
 	// FIXME parse Multistatus response
@@ -1189,6 +1270,11 @@ func (f *Fs) copyOrMove(ctx context.Context, src fs.Object, remote string, metho
 		return srcFs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
+		if apiErr, ok := err.(*api.Error); ok {
+			if mappedErr := srcFs.handleHTTPError(ctx, apiErr, src.Remote(), "copy/move"); mappedErr != apiErr {
+				return nil, mappedErr
+			}
+		}
 		return nil, fmt.Errorf("copy call failed: %w", err)
 	}
 	dstObj, err := f.NewObject(ctx, remote)
@@ -1293,6 +1379,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return srcFs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
+		if apiErr, ok := err.(*api.Error); ok {
+			if mappedErr := srcFs.handleHTTPError(ctx, apiErr, srcRemote, "dirmove"); mappedErr != apiErr {
+				return mappedErr
+			}
+		}
 		return fmt.Errorf("DirMove MOVE call failed: %w", err)
 	}
 	return nil
@@ -1494,6 +1585,9 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 				if apiErr.StatusCode == http.StatusNotFound {
 					return fs.ErrorObjectNotFound
 				}
+				if mappedErr := o.fs.handleHTTPError(ctx, apiErr, o.remote, "set modtime"); mappedErr != apiErr {
+					return mappedErr
+				}
 			}
 			return fmt.Errorf("couldn't set modified time: %w", err)
 		}
@@ -1638,6 +1732,11 @@ func (o *Object) updateSimple(ctx context.Context, body io.Reader, getBody func(
 		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
+		if apiErr, ok := err.(*api.Error); ok {
+			if mappedErr := o.fs.handleHTTPError(ctx, apiErr, o.remote, "upload"); mappedErr != apiErr {
+				err = mappedErr
+			}
+		}
 		// Give the WebDAV server a chance to get its internal state in order after the
 		// error.  The error may have been local in which case we closed the connection.
 		// The server may still be dealing with it for a moment. A sleep isn't ideal but I
@@ -1658,10 +1757,18 @@ func (o *Object) Remove(ctx context.Context) error {
 		Path:       o.filePath(),
 		NoResponse: true,
 	}
-	return o.fs.pacer.Call(func() (bool, error) {
+	err := o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.Call(ctx, &opts)
 		return o.fs.shouldRetry(ctx, resp, err)
 	})
+	if err != nil {
+		if apiErr, ok := err.(*api.Error); ok {
+			if mappedErr := o.fs.handleHTTPError(ctx, apiErr, o.remote, "delete"); mappedErr != apiErr {
+				return mappedErr
+			}
+		}
+	}
+	return err
 }
 
 // Check the interfaces are satisfied
